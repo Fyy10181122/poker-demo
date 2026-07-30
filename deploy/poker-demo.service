@@ -1,0 +1,25 @@
+# systemd 服务（不装 pm2 时的轻量替代方案）
+# 用法：
+#   sudo cp poker-demo.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now poker-demo
+#   sudo systemctl status poker-demo
+#
+# 注意：User 改成你自己的非 root 用户名；代码放在 /opt/poker-demo
+
+[Unit]
+Description=Pixel Poker Demo (炸金花+德州多人联机)
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/poker-demo
+ExecStart=/usr/bin/node /opt/poker-demo/server.js
+Restart=on-failure
+RestartSec=3
+Environment=PORT=3000
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target

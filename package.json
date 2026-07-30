@@ -1,0 +1,22 @@
+{
+  "name": "pixel-poker-demo",
+  "version": "0.1.0",
+  "description": "炸金花 + 德州扑克 多人联机最小Demo (Phaser.js + Node.js + Socket.io)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/sim.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5"
+  },
+  "devDependencies": {
+    "localtunnel": "^2.0.2",
+    "phaser": "^3.80.1",
+    "socket.io-client": "^4.7.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

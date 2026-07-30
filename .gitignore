@@ -1,0 +1,7 @@
+node_modules/
+.workbuddy/
+*.log
+npm-debug.log*
+.DS_Store
+.idea/
+.vscode/
