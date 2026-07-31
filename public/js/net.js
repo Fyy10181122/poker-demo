@@ -18,6 +18,7 @@ const NET = {
   joinRoom(roomId, name, cb) { this.socket.emit('joinRoom', { roomId, name }, cb); },
   start()   { this.socket.emit('startGame'); },
   action(a) { this.socket.emit('action', a); },
+  borrow()  { this.socket.emit('borrow'); },
   restart() { this.socket.emit('restart'); },
   leave()   { this.socket.emit('leaveRoom'); this.state = null; },
 

@@ -10,10 +10,13 @@ const G = require('./game-logic');
 
 const PORT = process.env.PORT || 3000;
 const MAX_PLAYERS = 8;
-const START_CHIPS = 1000;
+const START_CHIPS = 10000;   // 初始筹码
 const ANTE = 10;         // 底注
 const ZJH_RAISE = 10;    // 炸金花每次加注额
 const TEXAS_BET = 20;    // 德州每次下注/加注额
+const ALLIN_CAP = 1000;  // 德州 All-in 封顶
+const BANK_BORROW = 1000; // 每次向银行借款额
+const BANK_LIMIT = 10000;  // 单人累计借款上限
 
 const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
@@ -68,7 +71,7 @@ function sanitize(room, viewerId) {
       // 炸金花：自己看牌后才可见；德州：自己���底牌始终可见
       const canSee = revealed || (isSelf && (room.mode === 'texas' || p.looked));
       return {
-        id: p.id, name: p.name, chips: p.chips,
+        id: p.id, name: p.name, chips: p.chips, loan: p.loan,
         folded: p.folded, looked: p.looked,
         betThisRound: p.betThisRound,
         cardCount: p.cards.length,
@@ -93,15 +96,15 @@ function startHand(room) {
   room.result = null;
   room.state = 'playing';
   room.players.forEach(p => {
-    if (p.chips <= 0) p.chips = START_CHIPS; // demo: 破产自动补码
     p.cards = [];
     p.folded = false;
     p.looked = false;
     p.betThisRound = 0;
     p.acted = false;
-    // 底注
-    p.chips -= ANTE;
-    room.pot += ANTE;
+    // 底注（没钱则贡献0，可后续向银行借款继续）
+    const need = Math.min(ANTE, p.chips);
+    p.chips -= need;
+    room.pot += need;
   });
   const cardNum = room.mode === 'zjh' ? 3 : 2;
   for (let i = 0; i < cardNum; i++) room.players.forEach(p => p.cards.push(room.deck.pop()));
@@ -184,12 +187,26 @@ function texasAction(room, p, act) {
     room.players.forEach(q => { if (!q.folded) q.acted = false; });
     p.acted = true;
     log(room, `${p.name} 加注到 ${room.currentBet}`);
+  } else if (act.type === 'allin') {
+    if (p.chips <= 0) return;
+    const amt = Math.min(p.chips, ALLIN_CAP); // 封顶1000
+    const diff = room.currentBet - p.betThisRound;
+    if (amt >= diff) {
+      room.currentBet = Math.max(room.currentBet, amt);
+      pay(room, p, amt - p.betThisRound);
+      room.players.forEach(q => { if (!q.folded) q.acted = false; });
+    } else {
+      pay(room, p, amt - p.betThisRound); // 短码：只投入全部筹码
+    }
+    p.acted = true;
+    log(room, `${p.name} All-in ${amt}` + (amt < diff ? '（短码）' : ''));
   } else return;
 
   const act2 = activePlayers(room);
   if (act2.length === 1) return win(room, [act2[0]], '其余玩家弃牌');
 
-  if (act2.every(q => q.acted && q.betThisRound === room.currentBet)) {
+  const roundDone = act2.every(q => (q.acted && q.betThisRound === room.currentBet) || q.chips === 0);
+  if (roundDone) {
     // 本轮下注结束 → 进入下一阶段
     if (room.stage === 3) return finishTexas(room);
     room.stage++;
@@ -245,7 +262,7 @@ io.on('connection', socket => {
       turn: 0, stage: 0, community: [], turnCount: 0,
       handCount: 0, result: null, log: []
     };
-    room.players.push({ id: socket.id, name: String(name || '玩家').slice(0, 8), chips: START_CHIPS, cards: [], folded: false, looked: false, betThisRound: 0, acted: false });
+    room.players.push({ id: socket.id, name: String(name || '玩家').slice(0, 8), chips: START_CHIPS, loan: 0, cards: [], folded: false, looked: false, betThisRound: 0, acted: false });
     rooms[id] = room;
     socket.join(id);
     socket.data.roomId = id;
@@ -258,7 +275,7 @@ io.on('connection', socket => {
     if (!room) return cb && cb({ error: '房间不存在' });
     if (room.state !== 'waiting') return cb && cb({ error: '游戏已开始' });
     if (room.players.length >= MAX_PLAYERS) return cb && cb({ error: '房间已满(8人)' });
-    room.players.push({ id: socket.id, name: String(name || '玩家').slice(0, 8), chips: START_CHIPS, cards: [], folded: false, looked: false, betThisRound: 0, acted: false });
+    room.players.push({ id: socket.id, name: String(name || '玩家').slice(0, 8), chips: START_CHIPS, loan: 0, cards: [], folded: false, looked: false, betThisRound: 0, acted: false });
     socket.join(roomId);
     socket.data.roomId = roomId;
     log(room, `${name} 加入了房间`);
@@ -291,6 +308,19 @@ io.on('connection', socket => {
     const room = rooms[socket.data.roomId];
     if (!room || room.hostId !== socket.id || room.state !== 'ended') return;
     startHand(room);
+    broadcast(room);
+  });
+
+  // 向银行借款（每次 +BANK_BORROW，累计不超过 BANK_LIMIT）
+  socket.on('borrow', () => {
+    const room = rooms[socket.data.roomId];
+    if (!room || room.state !== 'playing') return;
+    const p = getPlayer(room, socket.id);
+    if (!p || p.loan >= BANK_LIMIT) return;
+    const amt = Math.min(BANK_BORROW, BANK_LIMIT - p.loan);
+    p.chips += amt;
+    p.loan += amt;
+    log(room, `${p.name} 向银行借款 ${amt}`);
     broadcast(room);
   });
 

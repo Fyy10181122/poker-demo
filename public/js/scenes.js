@@ -206,9 +206,10 @@ class GameScene extends Phaser.Scene {
   drawPlayer(d, p, pos, s) {
     const isTurn = s.turnId === p.id;
     const w = pos.self ? 0 : 180;
+    const loanStr = p.loan > 0 ? ` 借${p.loan}` : '';
     if (!pos.self) {
       d.add(UI.panel(this, pos.x, pos.y, 190, 150, isTurn ? 0x4a5a2a : UI.COLORS.panel));
-      d.add(UI.text(this, pos.x, pos.y - 50, p.name + (isTurn ? ' ◀' : ''), 24, isTurn ? '#ffd54f' : '#ffffff'));
+      d.add(UI.text(this, pos.x, pos.y - 50, p.name + (isTurn ? ' ◀' : '') + loanStr, 24, isTurn ? '#ffd54f' : '#ffffff'));
       d.add(UI.text(this, pos.x, pos.y + 48, `筹码 ${p.chips}`, 20, '#66bb6a'));
       // 对手手牌（背面小牌）
       const n = p.cardCount, cw = 40;
@@ -225,7 +226,7 @@ class GameScene extends Phaser.Scene {
       // 自己：大牌在底部
       const n = p.cardCount, cw = 150;
       const showFace = p.cards.length > 0;
-      d.add(UI.text(this, UI.W / 2, 760, (isTurn ? '▶ 轮到你了 ◀' : p.name) + `　筹码 ${p.chips}`,
+      d.add(UI.text(this, UI.W / 2, 760, (isTurn ? '▶ 轮到你了 ◀' : p.name) + `　筹码 ${p.chips}` + loanStr,
         28, isTurn ? '#ffd54f' : '#ffffff'));
       for (let i = 0; i < n; i++) {
         const cx = UI.W / 2 - ((n - 1) * (cw * 0.72)) / 2 + i * cw * 0.72;
@@ -248,6 +249,9 @@ class GameScene extends Phaser.Scene {
     const btn = (x, y, label, color, enabled, cb, fs) =>
       d.add(UI.button(this, x, y, bw, bh, label, enabled ? color : dis, () => { if (enabled) cb(); }, fs || 24));
 
+    // 向银行借款（始终可用，每次 +1000）
+    btn(W / 2 - 255, y2, '借款+1000', 0x8d6e63, true, () => { NET.borrow(); SFX.chip(); });
+
     if (s.mode === 'zjh') {
       btn(xs[0], y1, me.looked ? '已看牌' : '看牌', COLORS.blue, !me.looked, () => { NET.action({ type: 'look' }); SFX.deal(); });
       btn(xs[1], y1, `跟注${s.currentBet}`, COLORS.green, myTurn, () => NET.action({ type: 'call' }), 22);
@@ -256,12 +260,14 @@ class GameScene extends Phaser.Scene {
       btn(W / 2, y2, '开牌 · 比大小', 0xb388ff, myTurn && s.canOpen, () => NET.action({ type: 'open' }), 26);
     } else {
       const diff = s.currentBet - me.betThisRound;
+      // 德州新增：All-in（封顶1000）
+      btn(xs[2], y1, 'All-in≤1000', 0xff7043, myTurn && me.chips > 0, () => NET.action({ type: 'allin' }), 20);
       if (diff <= 0) btn(xs[0], y1, '让牌', COLORS.blue, myTurn, () => NET.action({ type: 'check' }));
       else btn(xs[0], y1, `跟注${diff}`, COLORS.green, myTurn, () => NET.action({ type: 'call' }), 22);
       btn(xs[1], y1, '加注+20', COLORS.gold, myTurn, () => NET.action({ type: 'raise' }), 22);
-      btn(xs[2], y1, '弃牌', COLORS.red, myTurn, () => { NET.action({ type: 'fold' }); SFX.fold(); });
+      btn(xs[3], y1, '弃牌', COLORS.red, myTurn, () => { NET.action({ type: 'fold' }); SFX.fold(); });
       const stageName = ['翻牌前', '翻牌圈', '转牌圈', '河牌圈'][s.stage] || '';
-      d.add(UI.text(this, xs[3], y1, stageName, 24, '#9aa4b5'));
+      d.add(UI.text(this, W / 2 + 255, y2, stageName, 24, '#9aa4b5'));
     }
   }
 }
@@ -308,7 +314,8 @@ class ResultScene extends Phaser.Scene {
     // 筹码榜
     d.add(UI.text(this, W / 2, y + 30, '—— 筹码榜 ——', 26, '#9aa4b5'));
     [...s.players].sort((a, b) => b.chips - a.chips).forEach((p, i) => {
-      d.add(UI.text(this, W / 2, y + 80 + i * 40, `${i + 1}. ${p.name}  ${p.chips}`, 26,
+      const loanTxt = p.loan > 0 ? ` (借${p.loan})` : '';
+      d.add(UI.text(this, W / 2, y + 80 + i * 40, `${i + 1}. ${p.name}  ${p.chips}${loanTxt}`, 26,
         p.id === NET.myId ? '#ffd54f' : '#ffffff'));
     });
 
