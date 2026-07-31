@@ -122,6 +122,7 @@ class GameScene extends Phaser.Scene {
     g.lineStyle(8, 0x0d3a24, 1).strokeRoundedRect(30, 120, W - 60, H - 420, 60);
     this.dyn = this.add.container(0, 0);
     this.prevLogLen = 0;
+    this.raiseOpen = false;
     NET.onState = s => {
       if (s.state === 'ended') { this.scene.start('Result'); return; }
       if (s.state === 'waiting') { this.scene.start('Room'); return; }
@@ -201,6 +202,18 @@ class GameScene extends Phaser.Scene {
 
     // 操作按钮
     this.drawActions(d, s, me);
+
+    // 摊牌前看牌选择（最先 All-in 的玩家）
+    if (s.state === 'showdown-look') {
+      if (s.awaitingLookId === NET.myId) {
+        d.add(UI.text(this, W / 2, 1080, '你最先 All-in！选择看牌：', 30, '#ffd54f'));
+        d.add(UI.button(this, W / 2 - 180, 1180, 320, 96, '看1次', COLORS.blue, () => NET.action({ type: 'look', n: 1 }), 28));
+        d.add(UI.button(this, W / 2 + 180, 1180, 320, 96, '看2次', COLORS.blue, () => NET.action({ type: 'look', n: 2 }), 28));
+      } else {
+        const fp = s.players.find(q => q.id === s.awaitingLookId);
+        d.add(UI.text(this, W / 2, 1160, `等待 ${fp ? fp.name : '最先 All-in 玩家'} 看牌…`, 28, '#9aa4b5'));
+      }
+    }
   }
 
   drawPlayer(d, p, pos, s) {
@@ -209,7 +222,7 @@ class GameScene extends Phaser.Scene {
     const loanStr = p.loan > 0 ? ` 借${p.loan}` : '';
     if (!pos.self) {
       d.add(UI.panel(this, pos.x, pos.y, 190, 150, isTurn ? 0x4a5a2a : UI.COLORS.panel));
-      d.add(UI.text(this, pos.x, pos.y - 50, p.name + (isTurn ? ' ◀' : '') + loanStr, 24, isTurn ? '#ffd54f' : '#ffffff'));
+      d.add(UI.text(this, pos.x, pos.y - 50, p.name + (isTurn ? ' ◀' : '') + loanStr + (p.allIn ? ' [All-in]' : ''), 24, isTurn ? '#ffd54f' : '#ffffff'));
       d.add(UI.text(this, pos.x, pos.y + 48, `筹码 ${p.chips}`, 20, '#66bb6a'));
       // 对手手牌（背面小牌）
       const n = p.cardCount, cw = 40;
@@ -223,51 +236,81 @@ class GameScene extends Phaser.Scene {
       }
       if (p.betThisRound > 0) d.add(UI.text(this, pos.x, pos.y + 78, `注 ${p.betThisRound}`, 18, '#ffd54f'));
     } else {
-      // 自己：大牌在底部
+      // 自己：大牌在底部，按 seenCount 显示已看的牌，其余背面
       const n = p.cardCount, cw = 150;
-      const showFace = p.cards.length > 0;
+      const seen = p.seenCount || 0;
       d.add(UI.text(this, UI.W / 2, 760, (isTurn ? '▶ 轮到你了 ◀' : p.name) + `　筹码 ${p.chips}` + loanStr,
         28, isTurn ? '#ffd54f' : '#ffffff'));
       for (let i = 0; i < n; i++) {
         const cx = UI.W / 2 - ((n - 1) * (cw * 0.72)) / 2 + i * cw * 0.72;
-        const cardC = UI.card(this, cx, 900, p.cards[i] || null, showFace, cw);
+        const faceUp = i < seen;
+        const cardC = UI.card(this, cx, 900, faceUp ? p.cards[i] : null, faceUp, cw);
         if (p.folded) cardC.setAlpha(0.35);
         d.add(cardC);
       }
       if (p.folded) d.add(UI.text(this, UI.W / 2, 900, '已弃牌', 40, '#e05555'));
-      else if (!showFace && s.mode === 'zjh') d.add(UI.text(this, UI.W / 2, 985, '（未看牌）', 22, '#9aa4b5'));
+      else if (seen < n) d.add(UI.text(this, UI.W / 2, 985, `（已看 ${seen}/${n} 张）`, 22, '#9aa4b5'));
     }
   }
 
   drawActions(d, s, me) {
     const { W, COLORS } = UI;
     if (!me || me.folded) return;
+    if (s.state !== 'playing') return; // 摊牌看牌阶段不显示常规按钮
     const myTurn = NET.isMyTurn();
     const y1 = 1120, y2 = 1215, bw = 158, bh = 82;
     const xs = [W / 2 - 255, W / 2 - 85, W / 2 + 85, W / 2 + 255];
     const dis = 0x555c6b;
     const btn = (x, y, label, color, enabled, cb, fs) =>
       d.add(UI.button(this, x, y, bw, bh, label, enabled ? color : dis, () => { if (enabled) cb(); }, fs || 24));
+    const levels = [50, 100, 200, 500];
 
     // 向银行借款（始终可用，每次 +1000）
-    btn(W / 2 - 255, y2, '借款+1000', 0x8d6e63, true, () => { NET.borrow(); SFX.chip(); });
+    btn(xs[0], y2, '借款+1000', 0x8d6e63, true, () => { NET.borrow(); SFX.chip(); });
+
+    // 加注档位展开
+    if (this.raiseOpen) {
+      levels.forEach((lv, i) => btn(xs[i], y1, `+${lv}`, COLORS.gold, myTurn,
+        () => { NET.action({ type: 'raise', amount: lv }); this.raiseOpen = false; }, 24));
+      btn(xs[3], y2, '取消', dis, true, () => { this.raiseOpen = false; this.render(NET.state); }, 22);
+      return;
+    }
 
     if (s.mode === 'zjh') {
-      btn(xs[0], y1, me.looked ? '已看牌' : '看牌', COLORS.blue, !me.looked, () => { NET.action({ type: 'look' }); SFX.deal(); });
-      btn(xs[1], y1, `跟注${s.currentBet}`, COLORS.green, myTurn, () => NET.action({ type: 'call' }), 22);
-      btn(xs[2], y1, `加注+10`, COLORS.gold, myTurn, () => NET.action({ type: 'raise' }), 22);
+      const seen = me.seenCount || 0;
+      const canLook = seen < me.cardCount;
+      btn(xs[0], y1, '看1张', COLORS.blue, canLook, () => { NET.action({ type: 'look', n: 1 }); SFX.deal(); }, 22);
+      btn(xs[1], y1, '看2张', COLORS.blue, canLook && seen < me.cardCount - 1, () => { NET.action({ type: 'look', n: 2 }); SFX.deal(); }, 22);
+      btn(xs[2], y1, '加注', COLORS.gold, myTurn, () => { this.raiseOpen = true; this.render(NET.state); }, 22);
       btn(xs[3], y1, '弃牌', COLORS.red, myTurn, () => { NET.action({ type: 'fold' }); SFX.fold(); });
-      btn(W / 2, y2, '开牌 · 比大小', 0xb388ff, myTurn && s.canOpen, () => NET.action({ type: 'open' }), 26);
+      btn(xs[1], y2, `跟注${s.currentBet}`, COLORS.green, myTurn, () => NET.action({ type: 'call' }), 22);
+      btn(xs[2], y2, '开牌', 0xb388ff, myTurn && s.canOpen, () => NET.action({ type: 'open' }), 24);
     } else {
       const diff = s.currentBet - me.betThisRound;
-      // 德州新增：All-in（封顶1000）
-      btn(xs[2], y1, 'All-in≤1000', 0xff7043, myTurn && me.chips > 0, () => NET.action({ type: 'allin' }), 20);
-      if (diff <= 0) btn(xs[0], y1, '让牌', COLORS.blue, myTurn, () => NET.action({ type: 'check' }));
-      else btn(xs[0], y1, `跟注${diff}`, COLORS.green, myTurn, () => NET.action({ type: 'call' }), 22);
-      btn(xs[1], y1, '加注+20', COLORS.gold, myTurn, () => NET.action({ type: 'raise' }), 22);
-      btn(xs[3], y1, '弃牌', COLORS.red, myTurn, () => { NET.action({ type: 'fold' }); SFX.fold(); });
+      const iAmAllIn = me.allIn;
+      if (iAmAllIn) {
+        btn(xs[1], y1, '已 All-in', dis, false, () => {});
+      } else if (s.allInLocked) {
+        // All-in 锁定：本人不能加注，他人只能跟注 / 弃牌
+        if (diff <= 0) btn(xs[0], y1, '跟注', COLORS.green, myTurn, () => NET.action({ type: 'call' }), 22);
+        else btn(xs[0], y1, `跟注${diff}`, COLORS.green, myTurn, () => NET.action({ type: 'call' }), 22);
+        btn(xs[1], y1, '加注', COLORS.gold, false, () => {});
+        btn(xs[2], y1, 'All-in', 0xff7043, false, () => {});
+        btn(xs[3], y1, '弃牌', COLORS.red, myTurn, () => { NET.action({ type: 'fold' }); SFX.fold(); });
+      } else {
+        if (diff <= 0) btn(xs[0], y1, '让牌', COLORS.blue, myTurn, () => NET.action({ type: 'check' }));
+        else btn(xs[0], y1, `跟注${diff}`, COLORS.green, myTurn, () => NET.action({ type: 'call' }), 22);
+        btn(xs[1], y1, '加注', COLORS.gold, myTurn, () => { this.raiseOpen = true; this.render(NET.state); }, 22);
+        btn(xs[2], y1, 'All-in≤1000', 0xff7043, myTurn && me.chips > 0, () => NET.action({ type: 'allin' }), 18);
+        btn(xs[3], y1, '弃牌', COLORS.red, myTurn, () => { NET.action({ type: 'fold' }); SFX.fold(); });
+      }
+      // 德州也支持闷牌看牌
+      const seen = me.seenCount || 0;
+      const canLook = seen < me.cardCount;
+      btn(xs[1], y2, '看1张', COLORS.blue, canLook, () => { NET.action({ type: 'look', n: 1 }); SFX.deal(); }, 22);
+      btn(xs[2], y2, '看2张', COLORS.blue, canLook && seen < me.cardCount - 1, () => { NET.action({ type: 'look', n: 2 }); SFX.deal(); }, 22);
       const stageName = ['翻牌前', '翻牌圈', '转牌圈', '河牌圈'][s.stage] || '';
-      d.add(UI.text(this, W / 2 + 255, y2, stageName, 24, '#9aa4b5'));
+      d.add(UI.text(this, xs[3], y2, stageName, 24, '#9aa4b5'));
     }
   }
 }

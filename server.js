@@ -17,6 +17,7 @@ const TEXAS_BET = 20;    // 德州每次下注/加注额
 const ALLIN_CAP = 1000;  // 德州 All-in 封顶
 const BANK_BORROW = 1000; // 每次向银行借款额
 const BANK_LIMIT = 10000;  // 单人累计借款上限
+const RAISE_LEVELS = [50, 100, 200, 500]; // 加注档位
 
 const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
@@ -38,8 +39,13 @@ function nextTurn(room) {
   const n = room.players.length;
   for (let k = 1; k <= n; k++) {
     const j = (room.turn + k) % n;
-    if (!room.players[j].folded) { room.turn = j; return; }
+    if (!room.players[j].folded && room.players[j].chips > 0 && !room.players[j].allIn) { room.turn = j; return; }
   }
+}
+
+/** 德州：有人 All-in（封顶1000，本人本局锁定）后，其余玩家只能跟注/弃牌，本人不能再加注 */
+function allInLocked(room) {
+  return room.mode === 'texas' && room.firstAllInId != null;
 }
 
 /** 给每个客户端发送脱敏后的房间状态（只看得到自己的手牌） */
@@ -63,16 +69,19 @@ function sanitize(room, viewerId) {
     community: room.mode === 'texas' ? room.community : [],
     turnId: room.state === 'playing' ? room.players[room.turn].id : null,
     canOpen: room.mode === 'zjh' && room.turnCount >= activePlayers(room).length,
+    firstAllInId: room.firstAllInId || null,
+    awaitingLookId: room.awaitingLookId || null,
+    allInLocked: allInLocked(room),
     result: room.result || null,
     log: room.log.slice(-6),
     players: room.players.map(p => {
       const revealed = showAll && !p.folded;
       const isSelf = p.id === viewerId;
       // 炸金花：自己看牌后才可见；德州：自己���底牌始终可见
-      const canSee = revealed || (isSelf && (room.mode === 'texas' || p.looked));
+      const canSee = revealed || isSelf;
       return {
         id: p.id, name: p.name, chips: p.chips, loan: p.loan,
-        folded: p.folded, looked: p.looked,
+        folded: p.folded, looked: p.looked, seenCount: p.seenCount, allIn: !!p.allIn,
         betThisRound: p.betThisRound,
         cardCount: p.cards.length,
         cards: canSee ? p.cards : []
@@ -95,10 +104,15 @@ function startHand(room) {
   room.turnCount = 0;    // 已行动次数（炸金花开牌解锁用）
   room.result = null;
   room.state = 'playing';
+  room.firstAllInId = null;
+  room.awaitingLookId = null;
+  if (room._lookTimer) { clearTimeout(room._lookTimer); room._lookTimer = null; }
   room.players.forEach(p => {
     p.cards = [];
     p.folded = false;
     p.looked = false;
+    p.seenCount = 0;
+    p.allIn = false;
     p.betThisRound = 0;
     p.acted = false;
     // 底注（没钱则贡献0，可后续向银行借款继续）
@@ -126,8 +140,10 @@ function pay(room, p, amount) {
 /* --- 炸金花动作 --- */
 function zjhAction(room, p, act) {
   if (act.type === 'look') {
-    p.looked = true;
-    log(room, `${p.name} 看牌`);
+    const n = act.n === 2 ? 2 : 1;
+    p.seenCount = Math.min(p.cards.length, p.seenCount + n);
+    p.looked = p.seenCount > 0;
+    log(room, `${p.name} 看了 ${n} 张牌`);
     return; // 看牌不消耗回合
   }
   if (act.type === 'fold') {
@@ -137,8 +153,11 @@ function zjhAction(room, p, act) {
     pay(room, p, room.currentBet);
     log(room, `${p.name} 跟注 ${room.currentBet}`);
   } else if (act.type === 'raise') {
-    room.currentBet += ZJH_RAISE;
-    pay(room, p, room.currentBet);
+    const amt = (typeof act.amount === 'number' && act.amount > 0) ? act.amount : ZJH_RAISE;
+    room.currentBet += amt;
+    pay(room, p, room.currentBet - p.betThisRound);
+    room.players.forEach(q => { if (!q.folded) q.acted = false; });
+    p.acted = true;
     log(room, `${p.name} 加注到 ${room.currentBet}`);
   } else if (act.type === 'open') {
     // 开牌：需每人都至少行动过一轮
@@ -169,12 +188,18 @@ function finishZjh(room) {
 
 /* --- 德州动作 --- */
 function texasAction(room, p, act) {
+  if (act.type === 'look') {
+    const n = act.n === 2 ? 2 : 1;
+    p.seenCount = Math.min(p.cards.length, p.seenCount + n);
+    log(room, `${p.name} 看了 ${n} 张牌`);
+    return; // 看牌不消耗回合
+  }
   const diff = room.currentBet - p.betThisRound;
   if (act.type === 'fold') {
     p.folded = true;
     log(room, `${p.name} 弃牌`);
   } else if (act.type === 'check') {
-    if (diff > 0) return;
+    if (diff > 0 || allInLocked(room)) return;
     p.acted = true;
     log(room, `${p.name} 让牌`);
   } else if (act.type === 'call') {
@@ -182,13 +207,17 @@ function texasAction(room, p, act) {
     p.acted = true;
     log(room, `${p.name} 跟注 ${diff}`);
   } else if (act.type === 'raise') {
-    room.currentBet += TEXAS_BET;
+    if (allInLocked(room)) return; // All-in 锁定后禁止加注
+    const amt = (typeof act.amount === 'number' && act.amount > 0) ? act.amount : TEXAS_BET;
+    room.currentBet += amt;
     pay(room, p, room.currentBet - p.betThisRound);
     room.players.forEach(q => { if (!q.folded) q.acted = false; });
     p.acted = true;
     log(room, `${p.name} 加注到 ${room.currentBet}`);
   } else if (act.type === 'allin') {
     if (p.chips <= 0) return;
+    if (room.firstAllInId == null) room.firstAllInId = p.id;
+    p.allIn = true; // 本局锁定，不能再加注/跟注
     const amt = Math.min(p.chips, ALLIN_CAP); // 封顶1000
     const diff = room.currentBet - p.betThisRound;
     if (amt >= diff) {
@@ -205,9 +234,13 @@ function texasAction(room, p, act) {
   const act2 = activePlayers(room);
   if (act2.length === 1) return win(room, [act2[0]], '其余玩家弃牌');
 
-  const roundDone = act2.every(q => (q.acted && q.betThisRound === room.currentBet) || q.chips === 0);
+  const roundDone = act2.every(q => (q.acted && q.betThisRound === room.currentBet) || q.chips === 0 || q.allIn);
   if (roundDone) {
-    // 本轮下注结束 → 进入下一阶段
+    // 有人 All-in 且本轮下注结束 → 补满公共牌，让最先 All-in 的玩家看牌后摊牌
+    if (room.firstAllInId != null) {
+      while (room.community.length < 5) room.community.push(room.deck.pop());
+      return texasShowdownWithLook(room);
+    }
     if (room.stage === 3) return finishTexas(room);
     room.stage++;
     const dealN = room.stage === 1 ? 3 : 1;
@@ -233,6 +266,23 @@ function finishTexas(room) {
     else if (G.cmpScore(ev.score, best) === 0) winners.push(p);
   });
   win(room, winners, '摊牌', hands);
+}
+
+/** 德州 All-in 后：补满公共牌，让最先 All-in 的玩家先看 1/2 次牌，再摊牌 */
+function texasShowdownWithLook(room) {
+  const fp = room.firstAllInId ? getPlayer(room, room.firstAllInId) : null;
+  if (!fp || fp.folded) return finishTexas(room); // 该玩家已弃牌/断开 → 直接摊牌
+  room.state = 'showdown-look';
+  room.awaitingLookId = fp.id;
+  broadcast(room);
+  // 20 秒未选择则默认看 2 张
+  room._lookTimer = setTimeout(() => {
+    if (room.state === 'showdown-look' && rooms[room.id]) {
+      fp.seenCount = fp.cards.length;
+      room.state = 'playing';
+      finishTexas(room);
+    }
+  }, 20000);
 }
 
 function win(room, winners, reason, hands) {
@@ -262,7 +312,7 @@ io.on('connection', socket => {
       turn: 0, stage: 0, community: [], turnCount: 0,
       handCount: 0, result: null, log: []
     };
-    room.players.push({ id: socket.id, name: String(name || '玩家').slice(0, 8), chips: START_CHIPS, loan: 0, cards: [], folded: false, looked: false, betThisRound: 0, acted: false });
+    room.players.push({ id: socket.id, name: String(name || '玩家').slice(0, 8), chips: START_CHIPS, loan: 0, cards: [], folded: false, looked: false, seenCount: 0, betThisRound: 0, acted: false });
     rooms[id] = room;
     socket.join(id);
     socket.data.roomId = id;
@@ -275,7 +325,7 @@ io.on('connection', socket => {
     if (!room) return cb && cb({ error: '房间不存在' });
     if (room.state !== 'waiting') return cb && cb({ error: '游戏已开始' });
     if (room.players.length >= MAX_PLAYERS) return cb && cb({ error: '房间已满(8人)' });
-    room.players.push({ id: socket.id, name: String(name || '玩家').slice(0, 8), chips: START_CHIPS, loan: 0, cards: [], folded: false, looked: false, betThisRound: 0, acted: false });
+    room.players.push({ id: socket.id, name: String(name || '玩家').slice(0, 8), chips: START_CHIPS, loan: 0, cards: [], folded: false, looked: false, seenCount: 0, betThisRound: 0, acted: false });
     socket.join(roomId);
     socket.data.roomId = roomId;
     log(room, `${name} 加入了房间`);
@@ -294,7 +344,19 @@ io.on('connection', socket => {
 
   socket.on('action', act => {
     const room = rooms[socket.data.roomId];
-    if (!room || room.state !== 'playing') return;
+    if (!room) return;
+    // 摊牌前：最先 All-in 的玩家选择看 1/2 次牌
+    if (room.state === 'showdown-look') {
+      if (act.type === 'look' && socket.id === room.awaitingLookId) {
+        const p = getPlayer(room, socket.id);
+        if (p) p.seenCount = Math.min(p.cards.length, p.seenCount + (act.n === 2 ? 2 : 1));
+        clearTimeout(room._lookTimer);
+        room.state = 'playing';
+        finishTexas(room);
+      }
+      return;
+    }
+    if (room.state !== 'playing') return;
     const p = getPlayer(room, socket.id);
     if (!p || p.folded) return;
     // 看牌可以随时进行，其它动作必须轮到自己
